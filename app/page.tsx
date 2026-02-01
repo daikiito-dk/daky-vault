@@ -12,9 +12,9 @@ const PROGRAM_ID = new PublicKey("6SVBFPT8bLcbp8eDud9ECSoVYJhzmXxgHm9iU5FviKAs")
 const DAKY_MINT = new PublicKey("CzLeDd7qrK8Y4XREpsb4uc5xVX9ktYcryGw3zXRSpump");
 const RPC_ENDPOINT = clusterApiUrl('devnet');
 
-// --- IDL (省略なし) ---
+// --- IDL (修正版) ---
 const IDL: anchor.Idl = {
-  "address": "6SVBFPT8bLcbp8eDud9ECSoVYJhzmXxgHm9iU5FviKAs",
+  "address": "6SVBFPT8bLcbp8eDud9ECSoVYJhzmXxgHm9iU5FviKAs", // あなたのIDのままでOK
   "metadata": { "name": "daky_contract", "version": "0.1.0", "spec": "0.1.0" },
   "instructions": [
     {
@@ -40,7 +40,8 @@ const IDL: anchor.Idl = {
     },
     {
       "name": "unstake",
-      "discriminator": [169, 23, 133, 108, 236, 202, 188, 148],
+      // 🔴 ここを修正しました！ (以前の [169, 23...] は間違いでした)
+      "discriminator": [191, 161, 103, 159, 64, 92, 14, 77],
       "accounts": [
         { "name": "userState", "writable": true },
         { "name": "user", "writable": true, "signer": true }
