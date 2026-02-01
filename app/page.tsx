@@ -5,15 +5,15 @@ import { useWallet, useAnchorWallet } from '@solana/wallet-adapter-react';
 import { PublicKey, SystemProgram, Connection } from '@solana/web3.js';
 import * as anchor from '@coral-xyz/anchor';
 import Image from 'next/image';
-import { APRBanner } from '@/components/APRBanner';
-import { RewardPreview } from '@/components/RewardPreview';
-import { LockStatus } from '@/components/LockStatus';
-import { useStakingInfo } from '@/hooks/useStakingInfo';
-import { useLockTimer } from '@/hooks/useLockTimer';
-import { PROGRAM_ID, RPC_ENDPOINT, DECIMALS, MIN_LOCK_DAYS, TESTIMONIALS } from '@/lib/constants';
-import { IDL } from '@/lib/idl';
-import { calculateEstimatedRewards, parseFormattedBalance, formatTimeRemaining } from '@/lib/utils';
-import type { DakyProgram, EstimatedRewards } from '@/lib/types';
+import { APRBanner } from './components/APRBanner';
+import { RewardPreview } from './components/RewardPreview';
+import { LockStatus } from './components/LockStatus';
+import { useStakingInfo } from './hooks/useStakingInfo';
+import { useLockTimer } from './hooks/useLockTimer';
+import { PROGRAM_ID, RPC_ENDPOINT, DECIMALS, MIN_LOCK_DAYS, TESTIMONIALS } from './lib/constants';
+import { IDL } from './lib/idl';
+import { calculateEstimatedRewards, parseFormattedBalance, formatTimeRemaining } from './lib/utils';
+import type { DakyProgram, EstimatedRewards, ActivityLog } from './lib/types';
 import '@/styles/globals.css';
 
 export default function Home() {
@@ -245,7 +245,7 @@ export default function Home() {
                 {activities.length === 0 ? (
                   <p className="no-activity">No recent activity</p>
                 ) : (
-                  activities.map((log, i) => (
+                  activities.map((log: ActivityLog, i: number) => (
                     <div key={i} className="activity-item">
                       <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                         <div className={`status-dot ${log.status}`}></div>
