@@ -5,16 +5,48 @@ import { useWallet, useAnchorWallet } from '@solana/wallet-adapter-react';
 import { PublicKey, SystemProgram, Connection, clusterApiUrl } from '@solana/web3.js';
 import { getAssociatedTokenAddress, getAccount } from '@solana/spl-token';
 import * as anchor from '@coral-xyz/anchor';
-import Image from 'next/image'; // Imageコンポーネントのインポート
+import Image from 'next/image';
 
 // --- 設定値 ---
 const PROGRAM_ID = new PublicKey("6SVBFPT8bLcbp8eDud9ECSoVYJhzmXxgHm9iU5FviKAs");
 const DAKY_MINT = new PublicKey("CzLeDd7qrK8Y4XREpsb4uc5xVX9ktYcryGw3zXRSpump");
 const RPC_ENDPOINT = clusterApiUrl('devnet');
+const FETCH_INTERVAL = 15000; // 15秒ごとに更新（RPCレート制限対策）
+const DECIMALS = 6; // DAKYトークンの小数点桁数
 
-// --- IDL (修正版) ---
-const IDL: anchor.Idl = {
-  "address": "6SVBFPT8bLcbp8eDud9ECSoVYJhzmXxgHm9iU5FviKAs", // あなたのIDのままでOK
+// --- 型定義 ---
+type ActivityLog = {
+  signature: string;
+  slot: number;
+  blockTime: number;
+  status: 'success' | 'fail';
+};
+
+type GlobalStateAccount = {
+  maxStake: anchor.BN;
+  rewardRate: anchor.BN;
+};
+
+type UserStateAccount = {
+  stakedAmount: anchor.BN;
+  lastStakeTime: anchor.BN;
+};
+
+// Anchorプログラム用の型定義インターフェース
+interface DakyProgram extends anchor.Program {
+  account: {
+    globalState: {
+      fetch: (address: PublicKey) => Promise<GlobalStateAccount>;
+    };
+    userState: {
+      fetch: (address: PublicKey) => Promise<UserStateAccount>;
+    };
+  };
+}
+
+// --- IDL ---
+const IDL: anchor.Idl ={
+  "address": "6SVBFPT8bLcbp8eDud9ECSoVYJhzmXxgHm9iU5FviKAs",
   "metadata": { "name": "daky_contract", "version": "0.1.0", "spec": "0.1.0" },
   "instructions": [
     {
@@ -40,7 +72,6 @@ const IDL: anchor.Idl = {
     },
     {
       "name": "unstake",
-      // 🔴 ここを修正しました！ (以前の [169, 23...] は間違いでした)
       "discriminator": [191, 161, 103, 159, 64, 92, 14, 77],
       "accounts": [
         { "name": "userState", "writable": true },
@@ -64,20 +95,24 @@ const IDL: anchor.Idl = {
     }
   ],
   "errors": [
-    { "code": 6000, "name": "OverMaxStake", "msg": "預け入れ上限を超えています。" },
-    { "code": 6001, "name": "InsufficientFunds", "msg": "引き出し額が預け入れ額を超えています。" }
+    { "code": 6000, "name": "OverMaxStake", "msg": "Exceeds maximum stake limit." },
+    { "code": 6001, "name": "InsufficientFunds", "msg": "Insufficient staked amount." }
   ]
+} as const;
+
+// ユーティリティ関数: 大きな数字を読みやすくフォーマット
+const formatLargeNumber = (num: number): string => {
+  if (num >= 1_000_000_000) {
+    return (num / 1_000_000_000).toFixed(2) + 'B';
+  } else if (num >= 1_000_000) {
+    return (num / 1_000_000).toFixed(2) + 'M';
+  } else if (num >= 1_000) {
+    return (num / 1_000).toFixed(2) + 'K';
+  }
+  return num.toLocaleString('en-US', { maximumFractionDigits: 2 });
 };
 
-// 型定義
-type ActivityLog = {
-  signature: string;
-  slot: number;
-  blockTime: number;
-  status: 'success' | 'fail';
-};
-
-// モックデータ: 有識者コメント
+// モックデータ: コミュニティの声
 const TESTIMONIALS = [
   { name: "Early_Witness", role: "Holder", comment: "This isn't just a token, it's a social experiment. 'MeFi' is the next big narrative." },
   { name: "Destinx", role: "Right Hand", comment: "We value long-term vision over short-term hype. The team is always cooking." },
@@ -99,85 +134,208 @@ export default function Home() {
   const [amount, setAmount] = useState<string>("");
   const [mounted, setMounted] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [isFetching, setIsFetching] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string>("");
+  const [rewardRate, setRewardRate] = useState<number>(0.0001); // デフォルト値
 
   useEffect(() => { setMounted(true); }, []);
   
   useEffect(() => {
-    if (!publicKey) return;
+    if (!publicKey || !wallet) return;
     fetchInfo();
-    const interval = setInterval(fetchInfo, 10000);
+    const interval = setInterval(fetchInfo, FETCH_INTERVAL);
     return () => clearInterval(interval);
-  }, [publicKey, connection]);
+  }, [publicKey, wallet, connection]);
 
   const fetchInfo = async () => {
-    if (!publicKey) return;
-    try {
-      const ata = await getAssociatedTokenAddress(DAKY_MINT, publicKey);
-      const account = await getAccount(connection, ata);
-      setWalletBalance((Number(account.amount) / 1_000_000).toLocaleString());
-    } catch (e) { setWalletBalance("0"); }
+    if (!publicKey || !wallet) return;
+    setIsFetching(true);
+    setErrorMessage("");
 
     try {
-      const provider = new anchor.AnchorProvider(connection, (window as any).solana, {});
-      const program = new anchor.Program(IDL, provider) as any;
-      const [userState] = PublicKey.findProgramAddressSync([new TextEncoder().encode("user"), publicKey.toBuffer()], PROGRAM_ID);
-      
-      const data: any = await program.account.userState.fetch(userState);
-      const staked = data.stakedAmount.toNumber() / 1_000_000;
-      setStakedBalance(staked.toLocaleString());
+      // ウォレット残高の取得
+      try {
+        const ata = await getAssociatedTokenAddress(DAKY_MINT, publicKey);
+        const account = await getAccount(connection, ata);
+        const balance = Number(account.amount) / Math.pow(10, DECIMALS);
+        setWalletBalance(formatLargeNumber(balance));
+      } catch (e) {
+        console.warn("Failed to fetch wallet balance:", e);
+        setWalletBalance("0");
+      }
 
-      const lastStakeTime = data.lastStakeTime.toNumber();
-      const now = Math.floor(Date.now() / 1000);
-      const elapsed = Math.max(0, now - lastStakeTime);
-      const estimatedReward = staked > 0 ? (elapsed * 0.0001 * staked) : 0;
-      setRewardBalance(estimatedReward.toFixed(4));
+      // プログラムデータの取得
+      try {
+        const provider = new anchor.AnchorProvider(
+          connection, 
+          wallet, 
+          anchor.AnchorProvider.defaultOptions()
+        );
+        const program = new anchor.Program(IDL as anchor.Idl, provider) as unknown as DakyProgram;
+        
+        // GlobalStateを取得して報酬レートを更新
+        const [globalState] = PublicKey.findProgramAddressSync(
+          [new TextEncoder().encode("global")], 
+          PROGRAM_ID
+        );
+        
+        try {
+          const globalData = await program.account.globalState.fetch(globalState);
+          // 報酬レートを秒あたりの割合に変換
+          const ratePerSecond = Number(globalData.rewardRate.toString()) / Math.pow(10, DECIMALS);
+          setRewardRate(ratePerSecond);
+        } catch (e) {
+          console.warn("GlobalState not found, using default reward rate");
+        }
 
-      const signatures = await connection.getSignaturesForAddress(userState, { limit: 5 });
-      const logs: ActivityLog[] = signatures.map(sig => ({
-        signature: sig.signature,
-        slot: sig.slot,
-        blockTime: sig.blockTime || 0,
-        status: (sig.err ? 'fail' : 'success') as 'success' | 'fail'
-      }));
-      setActivities(logs);
-    } catch (e) { }
+        // UserStateの取得
+        const [userState] = PublicKey.findProgramAddressSync(
+          [new TextEncoder().encode("user"), publicKey.toBuffer()], 
+          PROGRAM_ID
+        );
+        
+        const userData = await program.account.userState.fetch(userState);
+        
+        // BigNumber処理: 文字列として扱い、表示時のみ数値変換
+        const stakedAmountStr = userData.stakedAmount.toString();
+        const staked = Number(stakedAmountStr) / Math.pow(10, DECIMALS);
+        setStakedBalance(formatLargeNumber(staked));
+
+        // 報酬計算
+        const lastStakeTime = Number(userData.lastStakeTime.toString());
+        const now = Math.floor(Date.now() / 1000);
+        const elapsed = Math.max(0, now - lastStakeTime);
+        const estimatedReward = staked > 0 ? (elapsed * rewardRate * staked) : 0;
+        setRewardBalance(formatLargeNumber(estimatedReward));
+
+        // アクティビティ履歴の取得
+        const signatures = await connection.getSignaturesForAddress(userState, { limit: 5 });
+        const logs: ActivityLog[] = signatures.map(sig => ({
+          signature: sig.signature,
+          slot: sig.slot,
+          blockTime: sig.blockTime || 0,
+          status: (sig.err ? 'fail' : 'success') as 'success' | 'fail'
+        }));
+        setActivities(logs);
+      } catch (e) {
+        console.warn("Failed to fetch program data:", e);
+        // UserStateが存在しない場合は初期値のまま
+      }
+    } catch (e) {
+      console.error("Error fetching info:", e);
+      setErrorMessage("Failed to fetch data. Please try again later.");
+    } finally {
+      setIsFetching(false);
+    }
   };
 
   const handleAction = async () => {
-    if (!wallet) return alert("Please connect wallet");
-    if (!amount || isNaN(Number(amount))) return alert("Enter amount");
+    if (!wallet) {
+      alert("Please connect your wallet");
+      return;
+    }
+    
+    if (!amount || isNaN(Number(amount)) || Number(amount) <= 0) {
+      alert("Please enter a valid amount");
+      return;
+    }
+
     setIsLoading(true);
+    setErrorMessage("");
 
     try {
-      const provider = new anchor.AnchorProvider(connection, wallet, anchor.AnchorProvider.defaultOptions());
-      const program = new anchor.Program(IDL, provider) as any;
-      const amountBN = new anchor.BN(Math.floor(parseFloat(amount) * 1_000_000));
+      const provider = new anchor.AnchorProvider(
+        connection, 
+        wallet, 
+        anchor.AnchorProvider.defaultOptions()
+      );
+      const program = new anchor.Program(IDL, provider) as unknown as DakyProgram;
       
-      const [globalState] = PublicKey.findProgramAddressSync([new TextEncoder().encode("global")], PROGRAM_ID);
-      const [userState] = PublicKey.findProgramAddressSync([new TextEncoder().encode("user"), wallet.publicKey.toBuffer()], PROGRAM_ID);
+      // ミームコイン対応: 大きな数字でもBNに正確に変換
+      const amountBN = new anchor.BN(Math.floor(parseFloat(amount) * Math.pow(10, DECIMALS)));
+      
+      const [globalState] = PublicKey.findProgramAddressSync(
+        [new TextEncoder().encode("global")], 
+        PROGRAM_ID
+      );
+      const [userState] = PublicKey.findProgramAddressSync(
+        [new TextEncoder().encode("user"), wallet.publicKey.toBuffer()], 
+        PROGRAM_ID
+      );
 
       let tx;
       if (activeTab === 'stake') {
-        tx = await program.methods.stake(amountBN).accounts({
-            globalState, userState, user: wallet.publicKey, systemProgram: SystemProgram.programId,
-          }).rpc();
+        tx = await (program as any).methods
+          .stake(amountBN)
+          .accounts({
+            globalState, 
+            userState, 
+            user: wallet.publicKey, 
+            systemProgram: SystemProgram.programId,
+          })
+          .rpc();
       } else {
-        tx = await program.methods.unstake(amountBN).accounts({
-            userState, user: wallet.publicKey,
-          }).rpc();
+        tx = await (program as any).methods
+          .unstake(amountBN)
+          .accounts({
+            userState, 
+            user: wallet.publicKey,
+          })
+          .rpc();
       }
-      alert("Success!\nTX: " + tx);
+      
+      alert(`Success!\nTransaction: ${tx.slice(0, 8)}...`);
       setAmount("");
-      fetchInfo();
+      
+      // トランザクション完了後に情報を再取得
+      setTimeout(() => fetchInfo(), 2000);
     } catch (err: any) {
-      console.error(err);
-      alert("Error: " + (err.msg || err.message));
+      console.error("Transaction error:", err);
+      
+      // より分かりやすいエラーメッセージ（英語）
+      let errorMsg = "Transaction failed.";
+      if (err.message?.includes("User rejected")) {
+        errorMsg = "Transaction was cancelled.";
+      } else if (err.message?.includes("insufficient")) {
+        errorMsg = "Insufficient balance.";
+      } else if (err.message?.includes("OverMaxStake")) {
+        errorMsg = "Exceeds maximum stake limit.";
+      } else if (err.message?.includes("InsufficientFunds")) {
+        errorMsg = "Insufficient staked amount to withdraw.";
+      } else if (err.logs) {
+        errorMsg += `\n${err.logs.join('\n')}`;
+      }
+      
+      alert(errorMsg);
+      setErrorMessage(errorMsg);
     } finally {
       setIsLoading(false);
     }
   };
 
-  const handleClaim = () => alert("Claim function is coming soon!");
+  const handleClaim = () => {
+    alert("Claim function coming soon!");
+  };
+
+  // 最大値ボタン（ウォレット残高全額 or ステーキング残高全額）
+  const handleMaxClick = () => {
+    if (activeTab === 'stake') {
+      // ウォレット残高の数値を取得（フォーマットを逆変換）
+      const balanceStr = walletBalance.replace(/[BKM,]/g, '');
+      const multiplier = walletBalance.includes('B') ? 1_000_000_000 : 
+                        walletBalance.includes('M') ? 1_000_000 : 
+                        walletBalance.includes('K') ? 1_000 : 1;
+      const balance = parseFloat(balanceStr) * multiplier;
+      setAmount(balance.toString());
+    } else {
+      const balanceStr = stakedBalance.replace(/[BKM,]/g, '');
+      const multiplier = stakedBalance.includes('B') ? 1_000_000_000 : 
+                        stakedBalance.includes('M') ? 1_000_000 : 
+                        stakedBalance.includes('K') ? 1_000 : 1;
+      const balance = parseFloat(balanceStr) * multiplier;
+      setAmount(balance.toString());
+    }
+  };
 
   if (!mounted) return null;
 
@@ -197,15 +355,33 @@ export default function Home() {
           <h1 style={{ fontSize: '4rem', fontWeight: '800', background: 'linear-gradient(to right, #fff, #94a3b8)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', margin: '0', letterSpacing: '-0.02em' }}>
             $DAKY <span style={{ color: '#A855F7', WebkitTextFillColor: '#A855F7' }}>VAULT</span>
           </h1>
-          <p style={{ color: '#64748b', letterSpacing: '0.3em', fontSize: '0.9rem', marginTop: '10px', textTransform: 'uppercase' }}>Identity to Equity</p>
+          <p style={{ color: '#64748b', letterSpacing: '0.3em', fontSize: '0.9rem', marginTop: '10px', textTransform: 'uppercase' }}>Identity to Equity v2</p>
         </div>
+
+        {/* Error Message */}
+        {errorMessage && (
+          <div style={{ 
+            background: 'rgba(239, 68, 68, 0.1)', 
+            border: '1px solid rgba(239, 68, 68, 0.3)', 
+            borderRadius: '12px', 
+            padding: '15px', 
+            marginBottom: '20px',
+            color: '#FCA5A5',
+            textAlign: 'center'
+          }}>
+            {errorMessage}
+          </div>
+        )}
 
         {/* Dashboard Grid */}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(350px, 1fr))', gap: '20px', marginBottom: '80px' }}>
           
           {/* Staking Card */}
           <div className="glass-card">
-            <h2 className="card-title">STAKING</h2>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
+              <h2 className="card-title" style={{ marginBottom: 0, paddingBottom: 0, border: 'none' }}>STAKING</h2>
+              {isFetching && <div className="loading-spinner" aria-label="Loading"></div>}
+            </div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '15px', marginBottom: '25px' }}>
               <div className="stat-box">
                 <p className="label">Wallet Balance</p>
@@ -218,17 +394,44 @@ export default function Home() {
             </div>
             <div style={{ display: 'flex', background: 'rgba(0,0,0,0.4)', borderRadius: '12px', padding: '4px', marginBottom: '20px' }}>
               {['stake', 'unstake'].map(tab => (
-                <button key={tab} onClick={() => setActiveTab(tab as any)}
-                  className={`tab-btn ${activeTab === tab ? 'active' : ''}`}>
+                <button 
+                  key={tab} 
+                  onClick={() => setActiveTab(tab as any)}
+                  className={`tab-btn ${activeTab === tab ? 'active' : ''}`}
+                  aria-label={`${tab} tab`}
+                >
                   {tab.toUpperCase()}
                 </button>
               ))}
             </div>
-            <div style={{ position: 'relative', marginBottom: '20px' }}>
-              <input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.00" className="input-field" />
+            <div style={{ position: 'relative', marginBottom: '10px' }}>
+              <input 
+                type="number" 
+                value={amount} 
+                onChange={(e) => setAmount(e.target.value)} 
+                placeholder="0.00" 
+                className="input-field"
+                aria-label="Amount input"
+                disabled={isLoading}
+                step="any"
+              />
               <span className="unit-label">DAKY</span>
             </div>
-            <button onClick={handleAction} disabled={isLoading} className={`action-btn ${activeTab}`}>
+            <button 
+              onClick={handleMaxClick}
+              className="max-btn"
+              disabled={isLoading || !wallet}
+              aria-label="Set maximum amount"
+            >
+              MAX
+            </button>
+            <button 
+              onClick={handleAction} 
+              disabled={isLoading || !wallet} 
+              className={`action-btn ${activeTab}`}
+              aria-label={activeTab === 'stake' ? 'Stake tokens' : 'Withdraw tokens'}
+              style={{ marginTop: '15px' }}
+            >
               {isLoading ? 'PROCESSING...' : (activeTab === 'stake' ? 'STAKE TOKENS' : 'WITHDRAW TOKENS')}
             </button>
             <div style={{ marginTop: '20px', display: 'flex', justifyContent: 'center' }}><WalletMultiButton /></div>
@@ -243,21 +446,31 @@ export default function Home() {
                 <p className="label" style={{ marginBottom: '5px' }}>Pending Rewards</p>
                 <p className="reward-value">{rewardBalance} <span style={{ fontSize: '1rem', color: '#64748b' }}>DAKY</span></p>
               </div>
-              <button onClick={handleClaim} className="claim-btn">CLAIM REWARDS</button>
+              <button 
+                onClick={handleClaim} 
+                className="claim-btn"
+                aria-label="Claim rewards"
+              >
+                CLAIM REWARDS
+              </button>
             </div>
             {/* Activity */}
             <div className="glass-card" style={{ flex: 1 }}>
               <h2 className="card-title">ACTIVITY</h2>
               <div className="activity-list">
-                {activities.length === 0 ? <p className="no-activity">No recent activity</p> : activities.map((log, i) => (
-                  <div key={i} className="activity-item">
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                      <div className={`status-dot ${log.status}`}></div>
-                      <span className="tx-hash">{log.signature.slice(0, 8)}...</span>
+                {activities.length === 0 ? (
+                  <p className="no-activity">No recent activity</p>
+                ) : (
+                  activities.map((log, i) => (
+                    <div key={i} className="activity-item">
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                        <div className={`status-dot ${log.status}`} aria-label={log.status}></div>
+                        <span className="tx-hash">{log.signature.slice(0, 8)}...</span>
+                      </div>
+                      <span className="tx-time">{log.blockTime ? new Date(log.blockTime * 1000).toLocaleTimeString() : 'Pending'}</span>
                     </div>
-                    <span className="tx-time">{log.blockTime ? new Date(log.blockTime * 1000).toLocaleTimeString() : 'Pending'}</span>
-                  </div>
-                ))}
+                  ))
+                )}
               </div>
             </div>
           </div>
@@ -280,12 +493,21 @@ export default function Home() {
         </div>
       </section>
 
-      {/* ✨ NEW: FOUNDER'S VOICE ✨ */}
+      {/* ✨ FOUNDER'S VOICE ✨ */}
       <section style={{ padding: '80px 20px', background: 'linear-gradient(180deg, rgba(255,255,255,0.02) 0%, rgba(0,0,0,0) 100%)' }}>
         <div style={{ maxWidth: '1000px', margin: '0 auto', display: 'flex', alignItems: 'center', gap: '50px', flexWrap: 'wrap', justifyContent: 'center' }}>
           <div className="founder-image-container">
-            {/* ⚠️ publicフォルダに daiki.png を配置してください */}
-            <Image src="/daiki.png" alt="Based Dev" width={250} height={250} className="founder-img" />
+            <Image 
+              src="/daiki.png" 
+              alt="Based Dev - Founder of DAKY" 
+              width={250} 
+              height={250} 
+              className="founder-img"
+              onError={(e) => {
+                // 画像読み込み失敗時のフォールバック
+                e.currentTarget.style.display = 'none';
+              }}
+            />
             <div className="founder-glow"></div>
           </div>
           <div style={{ maxWidth: '600px' }}>
@@ -303,7 +525,7 @@ export default function Home() {
         </div>
       </section>
 
-      {/* 2. ROADMAP (Based on Strategy Doc) */}
+      {/* 2. ROADMAP */}
       <section style={{ padding: '80px 20px' }}>
         <div style={{ maxWidth: '1000px', margin: '0 auto' }}>
           <h3 className="section-title" style={{ textAlign: 'center', marginBottom: '50px' }}>PROJECT ROADMAP</h3>
@@ -341,7 +563,7 @@ export default function Home() {
             <div className="content">
               <h3>Visual Evolution of Credibility</h3>
               <p>Turn your staking rewards into limited edition NFTs. Visualize the core identity etched into the blockchain.</p>
-              <button className="promo-btn">VIEW COLLECTION (Coming Soon)</button>
+              <button className="promo-btn" aria-label="View NFT collection">VIEW COLLECTION (Coming Soon)</button>
             </div>
           </div>
 
@@ -350,7 +572,11 @@ export default function Home() {
             <div className="content">
               <h3>Join the Family</h3>
               <p>Be Honest. Be Kind. Connect with other "Witnesses of Trust" and stay updated with the latest announcements.</p>
-              <button className="promo-btn telegram" onClick={() => window.open('https://t.me/DAKY_Official', '_blank')}>
+              <button 
+                className="promo-btn telegram" 
+                onClick={() => window.open('https://t.me/DAKY_Official', '_blank')}
+                aria-label="Join Telegram group"
+              >
                 JOIN TELEGRAM
               </button>
             </div>
@@ -367,7 +593,7 @@ export default function Home() {
               <div key={i} className="testimonial-card">
                 <p className="comment">"{item.comment}"</p>
                 <div className="author">
-                  <div className="avatar"></div>
+                  <div className="avatar" aria-hidden="true"></div>
                   <div>
                     <p className="name">{item.name}</p>
                     <p className="role">{item.role}</p>
@@ -395,6 +621,19 @@ export default function Home() {
         /* Glass Cards */
         .glass-card { padding: 30px; border-radius: 24px; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.08); backdrop-filter: blur(20px); }
         
+        /* Loading Spinner */
+        .loading-spinner {
+          width: 16px;
+          height: 16px;
+          border: 2px solid rgba(255,255,255,0.1);
+          border-top-color: #A855F7;
+          border-radius: 50%;
+          animation: spin 0.6s linear infinite;
+        }
+        @keyframes spin {
+          to { transform: rotate(360deg); }
+        }
+
         /* Founder Section */
         .founder-image-container { position: relative; width: 250px; height: 250px; display: flex; justify-content: center; align-items: center; }
         .founder-img { border-radius: 50%; border: 4px solid rgba(168, 85, 247, 0.5); z-index: 2; object-fit: cover; }
@@ -412,27 +651,55 @@ export default function Home() {
         /* Inputs & Buttons */
         .tab-btn { flex: 1; padding: 10px; border-radius: 8px; border: none; cursor: pointer; font-weight: 600; background: transparent; color: #64748b; transition: all 0.3s; }
         .tab-btn.active { background: rgba(255,255,255,0.1); color: white; }
-        .input-field { width: 100%; padding: 16px; padding-right: 60px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.1); border-radius: 16px; color: white; font-size: 1.5rem; outline: none; font-family: monospace; }
+        .tab-btn:hover:not(.active) { background: rgba(255,255,255,0.05); }
+        .input-field { width: 100%; padding: 16px; padding-right: 60px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.1); border-radius: 16px; color: white; font-size: 1.5rem; outline: none; font-family: monospace; transition: border-color 0.3s; }
+        .input-field:focus { border-color: rgba(168, 85, 247, 0.5); }
+        .input-field:disabled { opacity: 0.5; cursor: not-allowed; }
         .unit-label { position: absolute; right: 20px; top: 22px; color: #64748b; font-weight: bold; font-size: 0.8rem; }
-        .action-btn { width: 100%; padding: 18px; border-radius: 16px; border: none; font-weight: 700; cursor: pointer; color: white; transition: transform 0.1s; }
+        
+        /* MAX Button */
+        .max-btn {
+          width: 100%;
+          padding: 10px;
+          border-radius: 8px;
+          border: 1px solid rgba(168, 85, 247, 0.3);
+          background: rgba(168, 85, 247, 0.1);
+          color: #A855F7;
+          font-weight: 700;
+          cursor: pointer;
+          transition: all 0.2s;
+          font-size: 0.9rem;
+        }
+        .max-btn:hover:not(:disabled) { background: rgba(168, 85, 247, 0.2); transform: translateY(-1px); }
+        .max-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+        .action-btn { width: 100%; padding: 18px; border-radius: 16px; border: none; font-weight: 700; cursor: pointer; color: white; transition: all 0.2s; }
+        .action-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .action-btn:not(:disabled):hover { transform: translateY(-2px); box-shadow: 0 4px 20px rgba(168, 85, 247, 0.3); }
+        .action-btn:not(:disabled):active { transform: translateY(0); }
         .action-btn.stake { background: linear-gradient(135deg, #3B82F6, #A855F7); }
         .action-btn.unstake { background: linear-gradient(135deg, #EF4444, #F59E0B); }
         .claim-btn { width: 100%; padding: 14px; border-radius: 12px; border: 1px solid #10B981; background: rgba(16, 185, 129, 0.1); color: #10B981; font-weight: 700; cursor: pointer; transition: all 0.2s; }
-        .claim-btn:hover { background: rgba(16, 185, 129, 0.2); }
+        .claim-btn:hover { background: rgba(16, 185, 129, 0.2); transform: translateY(-2px); }
 
         /* Activity List */
         .activity-list { display: flex; flex-direction: column; gap: 10px; max-height: 200px; overflow-y: auto; }
-        .activity-item { display: flex; justify-content: space-between; align-items: center; padding: 10px; background: rgba(255,255,255,0.03); border-radius: 8px; }
+        .activity-list::-webkit-scrollbar { width: 6px; }
+        .activity-list::-webkit-scrollbar-track { background: rgba(255,255,255,0.05); border-radius: 3px; }
+        .activity-list::-webkit-scrollbar-thumb { background: rgba(168, 85, 247, 0.5); border-radius: 3px; }
+        .activity-item { display: flex; justify-content: space-between; align-items: center; padding: 10px; background: rgba(255,255,255,0.03); border-radius: 8px; transition: background 0.2s; }
+        .activity-item:hover { background: rgba(255,255,255,0.05); }
         .status-dot { width: 8px; height: 8px; border-radius: 50%; }
-        .status-dot.success { background: #10B981; }
-        .status-dot.fail { background: #EF4444; }
+        .status-dot.success { background: #10B981; box-shadow: 0 0 6px rgba(16, 185, 129, 0.5); }
+        .status-dot.fail { background: #EF4444; box-shadow: 0 0 6px rgba(239, 68, 68, 0.5); }
         .tx-hash { font-size: 0.9rem; color: #e2e8f0; font-family: monospace; }
         .tx-time { font-size: 0.8rem; color: #64748b; }
         .no-activity { color: #64748b; text-align: center; font-size: 0.9rem; padding: 20px; }
 
         /* Roadmap Grid */
         .roadmap-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; }
-        .roadmap-card { padding: 30px; border-radius: 16px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05); }
+        .roadmap-card { padding: 30px; border-radius: 16px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05); transition: all 0.3s; }
+        .roadmap-card:hover { transform: translateY(-5px); }
         .roadmap-card.done { border-color: #10B981; opacity: 0.6; }
         .roadmap-card.active { border-color: #A855F7; background: rgba(168, 85, 247, 0.05); transform: scale(1.02); box-shadow: 0 0 30px rgba(168, 85, 247, 0.1); }
         .phase { font-size: 0.7rem; font-weight: 700; color: #64748b; letter-spacing: 0.1em; }
@@ -446,13 +713,16 @@ export default function Home() {
         .promo-card .content { position: relative; z-index: 2; }
         .promo-card h3 { font-size: 1.8rem; margin: 0 0 15px 0; color: white; }
         .promo-card p { color: #cbd5e1; margin-bottom: 25px; line-height: 1.5; max-width: 80%; }
-        .promo-btn { padding: 12px 24px; border-radius: 8px; border: none; font-weight: 700; cursor: pointer; background: white; color: black; font-size: 0.9rem; }
+        .promo-btn { padding: 12px 24px; border-radius: 8px; border: none; font-weight: 700; cursor: pointer; background: white; color: black; font-size: 0.9rem; transition: all 0.2s; }
+        .promo-btn:hover { transform: translateY(-2px); box-shadow: 0 4px 15px rgba(255,255,255,0.3); }
         .promo-btn.telegram { background: #0088cc; color: white; }
 
         /* Marquee Animation */
         .marquee-container { width: 100%; overflow: hidden; position: relative; }
         .marquee-content { display: flex; gap: 30px; width: max-content; animation: scroll 40s linear infinite; }
-        .testimonial-card { width: 350px; background: rgba(255,255,255,0.03); padding: 25px; border-radius: 16px; border: 1px solid rgba(255,255,255,0.05); flex-shrink: 0; }
+        .marquee-content:hover { animation-play-state: paused; }
+        .testimonial-card { width: 350px; background: rgba(255,255,255,0.03); padding: 25px; border-radius: 16px; border: 1px solid rgba(255,255,255,0.05); flex-shrink: 0; transition: all 0.3s; }
+        .testimonial-card:hover { background: rgba(255,255,255,0.05); transform: translateY(-3px); }
         .comment { color: #e2e8f0; font-size: 1rem; line-height: 1.5; margin-bottom: 20px; font-style: italic; }
         .author { display: flex; align-items: center; gap: 15px; }
         .avatar { width: 40px; height: 40px; border-radius: 50%; background: linear-gradient(135deg, #3B82F6, #A855F7); }
@@ -466,8 +736,21 @@ export default function Home() {
         .bg-grid { position: fixed; width: 100%; height: 100%; background-image: linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px), linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px); background-size: 50px 50px; z-index: 0; opacity: 0.3; }
 
         /* Wallet Adapter Overrides */
-        .wallet-adapter-button { background-color: transparent !important; border: 1px solid rgba(255,255,255,0.2) !important; font-family: "Inter", sans-serif !important; height: 40px !important; }
-        .wallet-adapter-button:hover { background-color: rgba(255,255,255,0.1) !important; }
+        .wallet-adapter-button { background-color: transparent !important; border: 1px solid rgba(255,255,255,0.2) !important; font-family: "Inter", sans-serif !important; height: 40px !important; transition: all 0.2s !important; }
+        .wallet-adapter-button:hover:not([disabled]) { background-color: rgba(255,255,255,0.1) !important; border-color: rgba(168, 85, 247, 0.5) !important; }
+        
+        /* Animations */
+        @keyframes fadeInDown {
+          from { opacity: 0; transform: translateY(-20px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Responsive Design */
+        @media (max-width: 768px) {
+          h1 { font-size: 2.5rem !important; }
+          .promo-card p { max-width: 100%; }
+          .roadmap-grid { grid-template-columns: 1fr; }
+        }
       `}</style>
     </main>
   );
